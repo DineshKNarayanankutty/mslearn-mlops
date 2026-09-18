@@ -19,59 +19,146 @@ jobs:
     environment: dev
 
     steps:
+
+      # --------------------------------------------------
+      # 1. Checkout repository
+      # --------------------------------------------------
       - name: Check out repository
         uses: actions/checkout@v4
 
+      # --------------------------------------------------
+      # 2. Login to Azure
+      # --------------------------------------------------
       - name: Sign in to Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      # --------------------------------------------------
+      # 3. Install Azure ML CLI
+      # --------------------------------------------------
       - name: Install Azure ML CLI
         run: |
           az extension add -n ml -y
 
+      # --------------------------------------------------
+      # 4. Detect Azure ML workspace
+      # --------------------------------------------------
       - name: Detect Azure ML workspace
         id: detect
         run: |
-          RG_NAME=$(az group list --query "[?starts_with(name,'rg-ai300-l')].name | [0]" -o tsv)
+          RG_NAME=$(az group list \
+            --query "[?starts_with(name,'rg-ai300-l')].name | [0]" \
+            -o tsv)
+
           if [ -z "$RG_NAME" ]; then
             echo "No resource group starting with rg-ai300-l found." >&2
             exit 1
           fi
 
-          WS_NAME=$(az ml workspace list --resource-group "$RG_NAME" --query "[?starts_with(name,'mlw-ai300-l')].name | [0]" -o tsv)
+          WS_NAME=$(az ml workspace list \
+            --resource-group "$RG_NAME" \
+            --query "[?starts_with(name,'mlw-ai300-l')].name | [0]" \
+            -o tsv)
+
           if [ -z "$WS_NAME" ]; then
             echo "No workspace starting with mlw-ai300-l found in $RG_NAME." >&2
             exit 1
           fi
 
-          az configure --defaults group="$RG_NAME" workspace="$WS_NAME"
+          echo "Using Resource Group: $RG_NAME"
+          echo "Using Azure ML Workspace: $WS_NAME"
+
+          az configure --defaults \
+            group="$RG_NAME" \
+            workspace="$WS_NAME"
 
           echo "resource_group=$RG_NAME" >> "$GITHUB_OUTPUT"
           echo "workspace=$WS_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Run training job in dev and capture logs
+      # --------------------------------------------------
+      # 5. Run Azure ML training job
+      # --------------------------------------------------
+      - name: Run training job in dev and stream logs
         id: train
         run: |
           JOB_NAME="diabetes-train-dev-${{ github.run_id }}"
-          echo "Running Azure ML job: $JOB_NAME"
+
+          echo "Running Azure ML job in dev: $JOB_NAME"
+
           az ml job create \
             -f src/job.yml \
             --name "$JOB_NAME" \
             --set inputs.training_data.path=azureml:diabetes-dev-folder@latest \
-            --stream | tee training_output.log
+            --stream
 
-      - name: Extract dev metrics from logs
-        id: parse-metrics
+          echo "job_name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------
+      # 6. Download training outputs
+      # --------------------------------------------------
+      - name: Download dev training outputs
+        id: download
         run: |
-          if [ ! -f training_output.log ]; then
-            echo "No training_output.log found to parse metrics." >&2
+          JOB_NAME="${{ steps.train.outputs.job_name }}"
+
+          echo "Downloading outputs for Azure ML job: $JOB_NAME"
+
+          mkdir -p downloaded-job
+
+          az ml job download \
+            --name "$JOB_NAME" \
+            --output-name metrics_output \
+            --download-path downloaded-job
+
+          echo "Downloaded files:"
+          find downloaded-job -maxdepth 5 -type f | sort
+
+          METRICS_FILE=$(find downloaded-job -name metrics.json | head -n 1)
+
+          if [ -z "$METRICS_FILE" ]; then
+            echo "No metrics.json found in downloaded job outputs." >&2
             exit 1
           fi
 
-          ACC=$(grep -o "Accuracy: .*" training_output.log | tail -n 1 | awk '{print $2}') || true
-          AUC=$(grep -o "AUC: .*" training_output.log | tail -n 1 | awk '{print $2}') || true
+          echo "Metrics file found: $METRICS_FILE"
+
+          STUDIO_URL=$(az ml job show \
+            --name "$JOB_NAME" \
+            --query services.Studio.endpoint \
+            -o tsv)
+
+          echo "metrics_file=$METRICS_FILE" >> "$GITHUB_OUTPUT"
+          echo "studio_url=$STUDIO_URL" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------
+      # 7. Extract metrics from metrics.json
+      # --------------------------------------------------
+      - name: Extract dev metrics from output artifact
+        id: parse-metrics
+        run: |
+          METRICS_FILE="${{ steps.download.outputs.metrics_file }}"
+
+          if [ ! -f "$METRICS_FILE" ]; then
+            echo "Metrics file does not exist: $METRICS_FILE" >&2
+            exit 1
+          fi
+
+          echo "Reading metrics from: $METRICS_FILE"
+
+          ACC=$(python -c "
+          import json
+          with open(r'$METRICS_FILE', encoding='utf-8') as f:
+              data = json.load(f)
+          print(data['accuracy'])
+          ")
+
+          AUC=$(python -c "
+          import json
+          with open(r'$METRICS_FILE', encoding='utf-8') as f:
+              data = json.load(f)
+          print(data['auc'])
+          ")
 
           echo "Dev accuracy: $ACC"
           echo "Dev AUC: $AUC"
@@ -79,6 +166,9 @@ jobs:
           echo "dev_accuracy=$ACC" >> "$GITHUB_OUTPUT"
           echo "dev_auc=$AUC" >> "$GITHUB_OUTPUT"
 
+      # --------------------------------------------------
+      # 8. Comment metrics on pull request
+      # --------------------------------------------------
       - name: Comment dev metrics on pull request
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
@@ -87,16 +177,24 @@ jobs:
             const acc = '${{ steps.parse-metrics.outputs.dev_accuracy }}';
             const auc = '${{ steps.parse-metrics.outputs.dev_auc }}';
 
+            const jobName = 'diabetes-train-dev-${{ github.run_id }}';
+
+            const studioUrl = '${{ steps.download.outputs.studio_url }}';
+
             const prNumber = context.payload.pull_request.number;
 
             let body = '✅ Dev training workflow completed.';
-            if (acc || auc) {
-              body += '\n\n**Dev evaluation metrics**';
-              if (acc) body += `\n- Accuracy: ${acc}`;
-              if (auc) body += `\n- AUC: ${auc}`;
-            } else {
-              body += '\n\nMetrics could not be parsed from logs. Check the Azure Machine Learning job run for details.';
+
+            body += '\n\n**Azure ML job**';
+            body += `\n- Name: ${jobName}`;
+
+            if (studioUrl) {
+              body += `\n- Studio: ${studioUrl}`;
             }
+
+            body += '\n\n**Dev evaluation metrics**';
+            body += `\n- Accuracy: ${acc}`;
+            body += `\n- AUC: ${auc}`;
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
