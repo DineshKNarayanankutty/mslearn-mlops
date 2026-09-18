@@ -26,11 +26,15 @@ def get_data_collector() -> DataCollector:
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--subscription-id", dest="subscription_id", required=True)
-    parser.add_argument("--resource-group", dest="resource_group", required=True)
+    parser.add_argument("--subscription-id",
+                        dest="subscription_id", required=True)
+    parser.add_argument("--resource-group",
+                        dest="resource_group", required=True)
     parser.add_argument("--workspace", dest="workspace", required=True)
-    parser.add_argument("--endpoint-name", dest="endpoint_name", default="diabetes-endpoint")
-    parser.add_argument("--deployment-name", dest="deployment_name", default="blue")
+    parser.add_argument("--endpoint-name",
+                        dest="endpoint_name", default="diabetes-endpoint")
+    parser.add_argument("--deployment-name",
+                        dest="deployment_name", default="blue")
 
     return parser.parse_args()
 
